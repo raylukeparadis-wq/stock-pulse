@@ -8,5 +8,13 @@
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
+ <script src="%PUBLIC_URL%/client_refresh.js"></script>
+<script>
+  window.addEventListener('load', function() {
+    runDailyRefreshIfNeeded().then(function(result) {
+      console.log('Stock Pulse refresh:', result);
+    });
+  });
+</script>
   </body>
 </html>
