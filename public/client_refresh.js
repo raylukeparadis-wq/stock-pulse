@@ -1,4 +1,4 @@
-/**
+/** 
  * client_refresh.js
  * ====================
  * Add this to your stock-pulse frontend (loaded on page visit).
