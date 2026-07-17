@@ -1,4 +1,4 @@
-/**
+/** 
  * report_display.js
  * ====================
  * Renders the latest Stock Pulse report as a simple HTML list on the page.
