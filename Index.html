@@ -1,1 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Stock Pulse</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
 
+    <div id="stock-pulse-report">Loading...</div>
+
+    <script>
+      const WORKER_BASE = 'https://stock-pulse-worker.raylukeparadis.workers.dev';
+      const ALPACA_PROXY_BASE = 'https://alpaca-proxy.raylukeparadis.workers.dev';
+      const FETCH_DELAY_MS = 150;
+
+      function setStatus(msg) {
+        const el = document.getElementById('stock-pulse-report');
+        if (el) el.innerHTML = msg;
+      }
+
+      async function fetchLatestBarFromAlpaca(symbol) {
+        try {
+          const resp = await fetch(`${ALPACA_PROXY_BASE}/bars?symbol=${symbol}&limit=1`);
+          if (!resp.ok) return { error: `HTTP ${resp.status}` };
+          const payload = await resp.json();
+          const bars = payload.bars || [];
+          return bars.length ? bars[bars.length - 1] : { error: 'no bars in response' };
+        } catch (e) {
+          return { error: e.message || String(e) };
+        }
+      }
+
+      function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+      }
+
+      async function runDailyRefreshIfNeeded() {
+        setStatus('Step 1: checking /status...');
+        const statusResp = await fetch(`${WORKER_BASE}/status`);
+        if (!statusResp.ok) {
+          throw new Error(`/status returned HTTP ${statusResp.status}`);
+        }
+        const status = await statusResp.json();
+
+        if (status.alreadyRefreshedToday) {
+          setStatus(`Already refreshed today (${status.today}). Loading cached report...`);
+          return { skipped: true };
+        }
+
+        const { symbols } = status;
+        const bars = {};
+        let failCount = 0;
+
+        for (let i = 0; i < symbols.length; i++) {
+          const sym = symbols[i];
+          setStatus(`Step 2: fetching prices... ${i + 1}/${symbols.length} (${sym})${failCount > 0 ? ` — ${failCount} failed so far` : ''}`);
+          const result = await fetchLatestBarFromAlpaca(sym);
+          if (result && result.error) {
+            failCount++;
+            bars[sym] = null;
+          } else {
+            bars[sym] = result;
+          }
+          await sleep(FETCH_DELAY_MS);
+        }
+
+        setStatus(`Step 3: submitting ${symbols.length} results (${failCount} failed fetches) to backend...`);
+        const submitResp = await fetch(`${WORKER_BASE}/submit-daily-updat
