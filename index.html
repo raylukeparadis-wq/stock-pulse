@@ -15,10 +15,43 @@
       const WORKER_BASE = 'https://stock-pulse-worker.raylukeparadis.workers.dev';
       const ALPACA_PROXY_BASE = 'https://alpaca-proxy.raylukeparadis.workers.dev';
       const FETCH_DELAY_MS = 150;
+      const RETRY_COUNT = 3;
+      const RETRY_DELAY_MS = 1000;
 
       function setStatus(msg) {
         const el = document.getElementById('stock-pulse-report');
         if (el) el.innerHTML = msg;
+      }
+
+      function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+      }
+
+      // Retries transient network failures (the "intermittent Failed to
+      // fetch" issue) for the two critical calls that must succeed for a
+      // visit to count -- /status and /submit-chunk. Individual per-symbol
+      // price fetches already have their own error handling below and
+      // don't need this, since one missed symbol doesn't invalidate the
+      // whole chunk.
+      async function fetchWithRetry(url, options, label) {
+        let lastError;
+        for (let attempt = 0; attempt <= RETRY_COUNT; attempt++) {
+          try {
+            const resp = await fetch(url, options);
+            if (!resp.ok) {
+              lastError = new Error(`${label} returned HTTP ${resp.status}`);
+            } else {
+              return resp;
+            }
+          } catch (e) {
+            lastError = e;
+          }
+          if (attempt < RETRY_COUNT) {
+            setStatus(`${label} failed (attempt ${attempt + 1}/${RETRY_COUNT + 1}), retrying...`);
+            await sleep(RETRY_DELAY_MS);
+          }
+        }
+        throw lastError;
       }
 
       async function fetchLatestBarFromAlpaca(symbol) {
@@ -33,18 +66,13 @@
         }
       }
 
-      function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-      }
-
       // Fetches and submits ONE chunk (~50 symbols, ~15-30 seconds) per page
       // visit. Each visit automatically resumes from wherever the last one
       // left off -- no need to keep the tab open for the whole 497-symbol
       // cycle in one sitting.
       async function runOneChunk() {
         setStatus('Checking status...');
-        const statusResp = await fetch(`${WORKER_BASE}/status`);
-        if (!statusResp.ok) throw new Error(`/status returned HTTP ${statusResp.status}`);
+        const statusResp = await fetchWithRetry(`${WORKER_BASE}/status`, {}, '/status');
         const status = await statusResp.json();
 
         if (status.alreadyRefreshedToday) {
@@ -64,15 +92,11 @@
         }
 
         setStatus(`Chunk ${currentChunkNumber}/${totalChunks} — submitting...`);
-        const submitResp = await fetch(`${WORKER_BASE}/submit-chunk`, {
+        const submitResp = await fetchWithRetry(`${WORKER_BASE}/submit-chunk`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ bars }),
-        });
-        if (!submitResp.ok) {
-          const text = await submitResp.text();
-          throw new Error(`/submit-chunk returned HTTP ${submitResp.status}: ${text}`);
-        }
+        }, '/submit-chunk');
         const result = await submitResp.json();
 
         if (result.cycleComplete) {
@@ -117,7 +141,7 @@
         runOneChunk()
           .then(function() { return renderReport(); })
           .catch(function(err) {
-            setStatus(`<p style="color:red;">ERROR: ${err.message || String(err)}</p>`);
+            setStatus(`<p style="color:red;">ERROR: ${err.message || String(err)}</p><p><small>This can happen from a brief connectivity drop -- just reload the page to retry.</small></p>`);
           });
       });
     </script>
