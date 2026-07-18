@@ -8,5 +8,21 @@
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
+
+    <div id="stock-pulse-report">Loading...</div>
+
+    <script>
+      const WORKER_BASE = 'https://stock-pulse-worker.raylukeparadis.workers.dev';
+      const ALPACA_PROXY_BASE = 'https://alpaca-proxy.raylukeparadis.workers.dev';
+      const FETCH_DELAY_MS = 150;
+
+      function setStatus(msg) {
+        const el = document.getElementById('stock-pulse-report');
+        if (el) el.innerHTML = msg;
+      }
+
+      async function fetchLatestBarFromAlpaca(symbol) {
+        try {
+          const resp = await fetch(`${ALPACA_PROXY_BASE}/bars?symbol=${symbol}&limit=1`);
+          if (!resp.ok) return { error: `HTTP ${resp.status}` };
+          const
