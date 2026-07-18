@@ -5,6 +5,7 @@ import {
 } from "recharts";
 
 const WORKER_URL = "https://alpaca-proxy.raylukeparadis.workers.dev";
+const STOCK_PULSE_WORKER_URL = "https://stock-pulse-worker.raylukeparadis.workers.dev";
 const COOLDOWN_MS = 1000;
 
 function calcMA(data, period) {
@@ -33,20 +34,56 @@ function calcRSI(data, period = 7) {
   });
 }
 
-function sentimentColor(s) {
-  if (s >= 0.6) return "#22c55e";
-  if (s >= 0.2) return "#84cc16";
-  if (s >= -0.2) return "#94a3b8";
-  if (s >= -0.6) return "#f97316";
-  return "#ef4444";
+// Looks up a single ticker's status within the latest Stock Pulse report.
+// Returns null if no report is available yet, or a status object describing
+// where (if anywhere) this ticker currently sits: an active buy/short signal,
+// a watch-list entry one step away from confirming, or no signal at all.
+function getRecommendation(report, ticker) {
+  if (!report || report.error) return null;
+
+  const inLong = report.long?.find(item => item.symbol === ticker);
+  if (inLong) {
+    return {
+      status: "BUY", label: "Active Buy Signal", color: "#22c55e",
+      detail: `Score ${inLong.score} · confirmed ${inLong.streakDays}d`,
+      asOfDate: report.asOfDate,
+    };
+  }
+
+  const inShort = report.short?.find(item => item.symbol === ticker);
+  if (inShort) {
+    return {
+      status: "SHORT", label: "Active Short Signal", color: "#ef4444",
+      detail: `Score ${inShort.score} · trend ${inShort.trendPct}% · confirmed ${inShort.streakDays}d`,
+      asOfDate: report.asOfDate,
+    };
+  }
+
+  const inLongWatch = report.longWatch?.find(item => item.symbol === ticker);
+  if (inLongWatch) {
+    return {
+      status: "BUY_WATCH", label: "Buy Watch List", color: "#84cc16",
+      detail: `Score ${inLongWatch.score} · one day from confirming`,
+      asOfDate: report.asOfDate,
+    };
+  }
+
+  const inShortWatch = report.shortWatch?.find(item => item.symbol === ticker);
+  if (inShortWatch) {
+    return {
+      status: "SHORT_WATCH", label: "Short Watch List", color: "#f97316",
+      detail: `Score ${inShortWatch.score} · trend ${inShortWatch.trendPct}% · one day from confirming`,
+      asOfDate: report.asOfDate,
+    };
+  }
+
+  return {
+    status: "NONE", label: "No Active Signal", color: "#64748b",
+    detail: "Not currently meeting buy or short criteria",
+    asOfDate: report.asOfDate,
+  };
 }
-function sentimentLabel(s) {
-  if (s >= 0.6) return "Bullish";
-  if (s >= 0.2) return "Slightly Bullish";
-  if (s >= -0.2) return "Neutral";
-  if (s >= -0.6) return "Slightly Bearish";
-  return "Bearish";
-}
+
 function fmtVol(n) {
   if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
   if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
@@ -99,6 +136,7 @@ export default function StockAnalyzer() {
   const [error, setError] = useState(null);
   const [quote, setQuote] = useState(null);
   const [bars, setBars] = useState([]);
+  const [recommendation, setRecommendation] = useState(null);
   const [cooldown, setCooldown] = useState(0);
   const cooldownTimer = useRef(null);
 
@@ -125,12 +163,14 @@ export default function StockAnalyzer() {
     setError(null);
     setQuote(null);
     setBars([]);
+    setRecommendation(null);
     startCooldown();
 
     try {
-      const [quoteRes, barsRes] = await Promise.all([
+      const [quoteRes, barsRes, reportRes] = await Promise.all([
         fetch(`${WORKER_URL}/quote?symbol=${t}`),
         fetch(`${WORKER_URL}/bars?symbol=${t}&limit=30&timeframe=1Day`),
+        fetch(`${STOCK_PULSE_WORKER_URL}/report/latest`).catch(() => null),
       ]);
 
       if (quoteRes.status === 429 || barsRes.status === 429) {
@@ -147,6 +187,16 @@ export default function StockAnalyzer() {
       setQuote(quoteData);
       setBars(barsData.bars || []);
       setTicker(t);
+
+      // Recommendation lookup is best-effort -- if the backend is down or
+      // hasn't run a refresh yet, the rest of the analyzer still works fine,
+      // it just shows "no recommendation available" instead.
+      if (reportRes && reportRes.ok) {
+        const reportData = await reportRes.json();
+        setRecommendation(getRecommendation(reportData, t));
+      } else {
+        setRecommendation(null);
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -162,14 +212,11 @@ export default function StockAnalyzer() {
   }, [bars]);
 
   const lastRSI = rsiData[rsiData.length - 1]?.rsi;
-  const volRatio = quote ? quote.volume / (quote.volume * 0.9) : 1;
   const momentum = bars.length >= 2
     ? ((bars[bars.length - 1].close - bars[0].close) / bars[0].close * 100).toFixed(2)
     : "0.00";
 
-  // Static news sentiment (placeholder until a news API is wired in)
-  const demoSentiment = 0.32;
-  const tabs = ["price", "volume", "rsi", "sentiment"];
+  const tabs = ["price", "volume", "rsi", "recommendation"];
 
   return (
     <div style={{
@@ -282,7 +329,7 @@ export default function StockAnalyzer() {
                   color: activeTab === t ? "#e2e8f0" : "#64748b",
                   fontWeight: 600, fontSize: 13, cursor: "pointer", textTransform: "capitalize",
                 }}>
-                  {t === "rsi" ? "RSI" : t.charAt(0).toUpperCase() + t.slice(1)}
+                  {t === "rsi" ? "RSI" : t === "recommendation" ? "Recommendation" : t.charAt(0).toUpperCase() + t.slice(1)}
                 </button>
               ))}
             </div>
@@ -361,16 +408,58 @@ export default function StockAnalyzer() {
                 </>
               )}
 
-              {activeTab === "sentiment" && (
+              {activeTab === "recommendation" && (
                 <>
                   <div style={{ paddingLeft: 16, marginBottom: 16 }}>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: "#94a3b8" }}>News Sentiment</span>
-                    <span style={{ marginLeft: 12, fontSize: 12, color: "#475569" }}>Coming soon — news API integration pending</span>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: "#94a3b8" }}>Stock Pulse Recommendation</span>
+                    {recommendation?.asOfDate && (
+                      <span style={{ marginLeft: 12, fontSize: 12, color: "#475569" }}>As of {recommendation.asOfDate}</span>
+                    )}
                   </div>
-                  <div style={{ padding: "20px 16px", textAlign: "center", color: "#334155" }}>
-                    <div style={{ fontSize: 32, marginBottom: 10 }}>📰</div>
-                    <p style={{ margin: 0, fontSize: 14 }}>News sentiment will be wired to a live news API in the next update.</p>
-                  </div>
+
+                  {!recommendation && (
+                    <div style={{ padding: "20px 16px", textAlign: "center", color: "#334155" }}>
+                      <div style={{ fontSize: 32, marginBottom: 10 }}>⏳</div>
+                      <p style={{ margin: 0, fontSize: 14 }}>No recommendation data available right now.</p>
+                      <p style={{ margin: "4px 0 0", fontSize: 12, color: "#475569" }}>The daily analysis may not have run yet today.</p>
+                    </div>
+                  )}
+
+                  {recommendation && (
+                    <div style={{ padding: "8px 16px 20px" }}>
+                      <div style={{
+                        display: "inline-block", padding: "8px 20px", borderRadius: 10,
+                        background: `${recommendation.color}1a`, border: `1px solid ${recommendation.color}66`,
+                        marginBottom: 14,
+                      }}>
+                        <span style={{ fontSize: 20, fontWeight: 800, color: recommendation.color, letterSpacing: "-0.02em" }}>
+                          {recommendation.label}
+                        </span>
+                      </div>
+                      <p style={{ fontSize: 14, color: "#94a3b8", margin: "0 0 4px" }}>{recommendation.detail}</p>
+
+                      {recommendation.status === "BUY" && (
+                        <p style={{ fontSize: 12, color: "#475569", marginTop: 10 }}>
+                          Meets all buy criteria: composite score ≥ 2.0, controlled volatility, above both moving averages, confirmed volume trend.
+                        </p>
+                      )}
+                      {recommendation.status === "SHORT" && (
+                        <p style={{ fontSize: 12, color: "#475569", marginTop: 10 }}>
+                          Meets short criteria: weak trend, below both moving averages, declining volume, controlled volatility.
+                        </p>
+                      )}
+                      {(recommendation.status === "BUY_WATCH" || recommendation.status === "SHORT_WATCH") && (
+                        <p style={{ fontSize: 12, color: "#475569", marginTop: 10 }}>
+                          Passed all conditions today for the first time — needs one more qualifying day to confirm.
+                        </p>
+                      )}
+                      {recommendation.status === "NONE" && (
+                        <p style={{ fontSize: 12, color: "#475569", marginTop: 10 }}>
+                          This is not a rating of the company — it just means current price action doesn't meet the rule set's entry criteria today.
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -404,10 +493,10 @@ export default function StockAnalyzer() {
                   detail: `${lastRSI ?? "—"}`,
                 },
                 {
-                  label: "Sentiment",
-                  value: "Pending",
-                  color: "#475569",
-                  detail: "news API needed",
+                  label: "Recommendation",
+                  value: recommendation ? recommendation.label : "Unavailable",
+                  color: recommendation ? recommendation.color : "#475569",
+                  detail: recommendation?.status === "NONE" ? "no signal" : recommendation ? "Stock Pulse" : "no data",
                 },
               ].map(({ label, value, color, detail }) => (
                 <div key={label} style={{
@@ -422,7 +511,7 @@ export default function StockAnalyzer() {
             </div>
 
             <p style={{ textAlign: "center", fontSize: 11, color: "#334155", marginTop: 16 }}>
-              Live data via Alpaca Markets · Not financial advice
+              Live data via Alpaca Markets · Recommendations from Stock Pulse ruleset · Not financial advice
             </p>
           </>
         )}
