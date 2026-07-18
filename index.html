@@ -25,4 +25,97 @@
         try {
           const resp = await fetch(`${ALPACA_PROXY_BASE}/bars?symbol=${symbol}&limit=1`);
           if (!resp.ok) return { error: `HTTP ${resp.status}` };
-          const
+          const payload = await resp.json();
+          const bars = payload.bars || [];
+          return bars.length ? bars[bars.length - 1] : { error: 'no bars in response' };
+        } catch (e) {
+          return { error: e.message || String(e) };
+        }
+      }
+
+      function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+      }
+
+      async function runOneChunk() {
+        setStatus('Checking status...');
+        const statusResp = await fetch(`${WORKER_BASE}/status`);
+        if (!statusResp.ok) throw new Error(`/status returned HTTP ${statusResp.status}`);
+        const status = await statusResp.json();
+
+        if (status.alreadyRefreshedToday) {
+          setStatus(`Already fully refreshed today (${status.today}). Loading report...`);
+          return { skipped: true };
+        }
+
+        const { chunkSymbols, currentChunkNumber, totalChunks } = status;
+        const bars = {};
+
+        for (let i = 0; i < chunkSymbols.length; i++) {
+          const sym = chunkSymbols[i];
+          setStatus(`Chunk ${currentChunkNumber}/${totalChunks} — fetching ${i + 1}/${chunkSymbols.length} (${sym})...`);
+          const result = await fetchLatestBarFromAlpaca(sym);
+          bars[sym] = (result && result.error) ? null : result;
+          await sleep(FETCH_DELAY_MS);
+        }
+
+        setStatus(`Chunk ${currentChunkNumber}/${totalChunks} — submitting...`);
+        const submitResp = await fetch(`${WORKER_BASE}/submit-chunk`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bars }),
+        });
+        if (!submitResp.ok) {
+          const text = await submitResp.text();
+          throw new Error(`/submit-chunk returned HTTP ${submitResp.status}: ${text}`);
+        }
+        const result = await submitResp.json();
+
+        if (result.cycleComplete) {
+          setStatus(`Chunk ${currentChunkNumber}/${totalChunks} complete — full cycle finished! Loading report...`);
+        } else {
+          setStatus(`Chunk ${currentChunkNumber}/${totalChunks} complete. Visit again to continue with chunk ${currentChunkNumber + 1}/${totalChunks}.`);
+        }
+        return { skipped: false, result };
+      }
+
+      async function loadReport() {
+        const resp = await fetch(`${WORKER_BASE}/report/latest`);
+        return resp.json();
+      }
+
+      function renderReport() {
+        return loadReport().then(function(report) {
+          if (report.error) return report;
+          function renderSection(title, items) {
+            if (!items || items.length === 0) return `<h3>${title}</h3><p><em>None right now.</em></p>`;
+            const rows = items.map(function(item) {
+              return `<li><strong>${item.symbol}</strong> score: ${item.score} @ $${item.lastClose}</li>`;
+            }).join('');
+            return `<h3>${title} (${items.length})</h3><ul>${rows}</ul>`;
+          }
+          const existing = document.getElementById('stock-pulse-report').innerHTML;
+          setStatus(`
+            <p>${existing}</p>
+            <div>
+              <p><small>Report as of ${report.asOfDate}</small></p>
+              ${renderSection('Active Buy Signals', report.long)}
+              ${renderSection('Active Short Signals', report.short)}
+              ${renderSection('Buy Watch List', report.longWatch)}
+              ${renderSection('Short Watch List', report.shortWatch)}
+            </div>
+          `);
+          return report;
+        });
+      }
+
+      window.addEventListener('load', function() {
+        runOneChunk()
+          .then(function() { return renderReport(); })
+          .catch(function(err) {
+            setStatus(`<p style="color:red;">ERROR: ${err.message || String(err)}</p>`);
+          });
+      });
+    </script>
+  </body>
+</html>
