@@ -114,7 +114,8 @@
             if (!items || items.length === 0) return `<h3>${title}</h3><p><em>None right now.</em></p>`;
             const rows = items.map(function(item) {
               const entryPart = item.entryDate ? ` &nbsp; since ${item.entryDate} @ $${item.entryPrice}` : '';
-              return `<li><strong>${item.symbol}</strong> score: ${item.score} @ $${item.lastClose}${entryPart}</li>`;
+              const sectorPart = item.sector ? ` &nbsp; <em style="color:#666;">(${item.sector})</em>` : '';
+              return `<li><strong>${item.symbol}</strong>${sectorPart} score: ${item.score} @ $${item.lastClose}${entryPart}</li>`;
             }).join('');
             return `<h3>${title} (${items.length})</h3><ul>${rows}</ul>`;
           }
