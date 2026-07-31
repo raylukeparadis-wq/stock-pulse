@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Stock Pulse</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+
+    <div id="stock-pulse-report">Loading report...</div>
+
+    <script>
+      // Pure display -- this page no longer fetches or submits any price
+      // data itself. All data refresh happens server-side via a Cloudflare
+      // Cron Trigger (see the scheduled() handler in worker.js), which is
+      // now the ONLY writer to the dataset. This avoids the race condition
+      // that occurred when both the browser and cron could write to the
+      // same KV keys close together in time, which caused duplicate
+      // entries in the report.
+      const WORKER_BASE = 'https://stock-pulse-worker.raylukeparadis.workers.dev';
+
+      // ---- Sector override admin state (session-only; never persisted) ----
+      // The seed token is held in memory only for the life of this page. It is
+      // prompted for the first time you use a sector dropdown and cleared on
+      // reload / tab close. Symbols assigned this session are marked "pending"
+      // (blue) since the label only updates after the next completed cycle.
+      const STANDARD_SECTORS = [
+        'Communication Services', 'Consumer Discretionary', 'Consumer Staples',
+        'Energy', 'Financials', 'Health Care', 'Industrials',
+        'Information Technology', 'Materials', 'Real Estate', 'Utilities',
+      ];
+      let sessionToken = null;              // in-memory only
+      const pendingSectors = {};            // symbol -> chosen sector this session
+      let savedOverrides = {};              // symbol -> sector, pulled from backend KV (survives reloads)
+
+      // Pull the durable overrides map from the backend so already-assigned
+      // symbols stay highlighted across reloads until a cycle clears them.
+      async function loadSavedOverrides() {
+        try {
+          const res = await fetch(`${WORKER_BASE}/config/sector-overrides`);
+          if (!res.ok) return;
+          const data = await res.json();
+          savedOverrides = (data && data.overrides) ? data.overrides : {};
+        } catch (e) { /* leave savedOverrides as-is on failure */ }
+      }
+
+      function setStatus(msg) {
+        const el = document.getElementById('stock-pulse-report');
+        if (el) el.innerHTML = msg;
+      }
+
+      async function loadReport() {
+        const resp = await fetch(`${WORKER_BASE}/report/latest`);
+        return resp.json();
+      }
+
+      // Collect every symbol currently resolving to Unknown, across all
+      // sections, deduped. A symbol counts as unknown if its sector is missing
+      // or literally 'Unknown'.
+      function collectUnknownSymbols(report) {
+        const seen = new Set();
+        const unknowns = [];
+        const consider = (item) => {
+          if (!item || !item.symbol) return;
+          const sector = item.sector || 'Unknown';
+          if (sector !== 'Unknown') return;
+          if (seen.has(item.symbol)) return;
+          seen.add(item.symbol);
+          unknowns.push(item.symbol);
+        };
+        (report.long || []).forEach(consider);
+        (report.longWatch || []).forEach(consider);
+        (report.trackedPositions || []).forEach(consider);
+        if (report.paperPortfolio && report.paperPortfolio.holdings) {
+          report.paperPortfolio.holdings.forEach(consider);
+        }
+        unknowns.sort();
+        return unknowns;
+      }
+
+      function renderUnknownPanel(report) {
+        const unknowns = collectUnknownSymbols(report);
+        if (unknowns.length === 0) return '';
+        const options = ['<option value="">— pick sector —</option>']
+          .concat(STANDARD_SECTORS.map(s => `<option value="${s}">${s}</option>`))
+          .concat(['<option value="__remove__">Remove override</option>'])
+          .join('');
+
+        // A symbol is "assigned" if it has a saved override (from KV) or was set
+        // this session. Assigned rows are blue with no dropdown; unhandled rows
+        // are amber with a dropdown.
+        const assignedSector = (sym) => pendingSectors[sym] || savedOverrides[sym] || null;
+
+        const unhandled = unknowns.filter(sym => !assignedSector(sym));
+        const assigned = unknowns.filter(sym => assignedSector(sym));
+
+        const unhandledRows = unhandled.map(function(sym) {
+          return `<li data-sym="${sym}" style="background:#fef3c7;border-left:3px solid #f59e0b;padding:6px 8px;margin:4px 0;list-style:none;border-radius:3px;">
+            <strong>${sym}</strong> &nbsp;
+            <select onchange="assignSector('${sym}', this.value)" style="padding:3px;">${options}</select>
+          </li>`;
+        }).join('');
+
+        const assignedRows = assigned.map(function(sym) {
+          const sector = assignedSector(sym);
+          return `<li data-sym="${sym}" style="background:#dbeafe;border-left:3px solid #3b82f6;padding:6px 8px;margin:4px 0;list-style:none;border-radius:3px;">
+            <strong>${sym}</strong> <span style="color:#1d4ed8;font-size:12px;"> &nbsp; ✓ set to <strong>${sector}</strong> — applies next cycle</span>
+          </li>`;
+        }).join('');
+
+        const unhandledBlock = unhandled.length
+          ? `<ul style="padding-left:0;">${unhandledRows}</ul>`
+          : `<p style="font-size:12px;color:#166534;">All current unknowns have been assigned — waiting on the next refresh cycle.</p>`;
+        const assignedBlock = assigned.length
+          ? `<h4 style="margin:10px 0 4px;color:#1d4ed8;">Assigned, pending next cycle (${assigned.length})</h4><ul style="padding-left:0;">${assignedRows}</ul>`
+          : '';
+
+        return `
+          <div style="border:1px solid #f59e0b;border-radius:4px;margin:8px 0;overflow:hidden;">
+            <div onclick="toggleUnknownPanel()" style="cursor:pointer;background:#fffbeb;padding:8px 10px;user-select:none;display:flex;align-items:center;gap:6px;">
+              <span id="unknown-caret" style="color:#b45309;font-size:12px;">▸</span>
+              <strong style="color:#b45309;">🏷️ Unknown Sectors (${unknowns.length})</strong>
+              <span id="unknown-hint" style="color:#92400e;font-size:12px;margin-left:auto;">tap to expand</span>
+            </div>
+            <div id="unknown-body" style="display:none;padding:8px 10px;">
+              <p style="font-size:12px;color:#92400e;margin-top:0;">Symbols with no sector mapping. Amber = pick a sector to assign one (you'll be asked for your admin token once per session). Blue = already assigned and waiting for the next refresh cycle to take effect.</p>
+              ${unhandledBlock}
+              ${assignedBlock}
+            </div>
+          </div>
+        `;
+      }
+
+      // Generic collapse/expand for any panel built with collapsibleSection().
+      // Resets to collapsed on every page load.
+      function togglePanel(id) {
+        const body = document.getElementById(id + '-body');
+        const caret = document.getElementById(id + '-caret');
+        const hint = document.getElementById(id + '-hint');
+        if (!body) return;
+        const open = body.style.display !== 'none';
+        body.style.display = open ? 'none' : 'block';
+        if (caret) caret.textContent = open ? '▸' : '▾';
+        if (hint) hint.textContent = open ? 'tap to expand' : 'tap to collapse';
+      }
+
+      // Builds a collapsed-by-default panel with a clickable header bar showing
+      // a count. bodyHtml is whatever should appear when expanded.
+      function collapsibleSection(id, titleHtml, count, bodyHtml, accent) {
+        const color = accent || '#334155';
+        const countPart = (count === '' || count === null || count === undefined) ? '' : ` (${count})`;
+        return `
+          <div style="border:1px solid #cbd5e1;border-radius:4px;margin:8px 0;overflow:hidden;">
+            <div onclick="togglePanel('${id}')" style="cursor:pointer;background:#f8fafc;padding:8px 10px;user-select:none;display:flex;align-items:center;gap:6px;">
+              <span id="${id}-caret" style="color:${color};font-size:12px;">▸</span>
+              <strong style="color:${color};">${titleHtml}${countPart}</strong>
+              <span id="${id}-hint" style="color:#64748b;font-size:12px;margin-left:auto;">tap to expand</span>
+            </div>
+            <div id="${id}-body" style="display:none;padding:8px 10px;">${bodyHtml}</div>
+          </div>
+        `;
+      }
+
+      function toggleUnknownPanel() { togglePanel('unknown'); }
+      function toggleStalePanel() { togglePanel('stale'); }
+
+      // Called from the dropdown. Prompts for the token once, POSTs the
+      // override (or a removal), and flips the row to pending on success.
+      async function assignSector(symbol, value) {
+        if (!value) return; // blank re-selection, ignore
+        if (!sessionToken) {
+          sessionToken = window.prompt('Admin token (held only until you close this page):');
+          if (!sessionToken) return; // cancelled
+        }
+        const isRemove = value === '__remove__';
+        const body = {};
+        body[symbol] = isRemove ? null : value;
+        try {
+          const res = await fetch(`${WORKER_BASE}/config/sector-overrides`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Seed-Token': sessionToken },
+            body: JSON.stringify(body),
+          });
+          if (res.status === 401) {
+            sessionToken = null; // wrong token -- clear so we re-prompt next time
+            alert('Unauthorized — token cleared. Try again.');
+            return;
+          }
+          if (!res.ok) {
+            alert(`Save failed (${res.status}).`);
+            return;
+          }
+          if (isRemove) {
+            delete pendingSectors[symbol];
+            delete savedOverrides[symbol];
+          } else {
+            pendingSectors[symbol] = value;
+            savedOverrides[symbol] = value;
+          }
+          // Re-render just the panel in place so the row reflects the new state.
+          refreshUnknownPanel();
+        } catch (e) {
+          alert('Save error: ' + (e.message || String(e)));
+        }
+      }
+
+      // Holds the last report so the panel can re-render without a full reload.
+      let lastReport = null;
+      function refreshUnknownPanel() {
+        const container = document.getElementById('unknown-sectors-panel');
+        if (!container || !lastReport) return;
+        // preserve whether the panel was expanded before re-rendering
+        const prevBody = document.getElementById('unknown-body');
+        const wasOpen = prevBody && prevBody.style.display !== 'none';
+        container.innerHTML = renderUnknownPanel(lastReport);
+        if (wasOpen) {
+          const body = document.getElementById('unknown-body');
+          const caret = document.getElementById('unknown-caret');
+          if (body) body.style.display = 'block';
+          if (caret) caret.textContent = '▾';
+          const hint = document.getElementById('unknown-hint');
+          if (hint) hint.textContent = 'tap to collapse';
+        }
+      }
+
+      function renderReport() {
+        return loadReport().then(function(report) {
+          if (report.error) {
+            setStatus('<p>No report available yet. Check back after the next scheduled refresh.</p>');
+            return report;
+          }
+          lastReport = report;
+
+          // Returns a ▲/▼ + avg% tag for a sector from report.sectorPerformance,
+          // or '' if there's no data for that sector. Used to decorate the
+          // sector subheaders across all four signal sections.
+          const sectorPerf = report.sectorPerformance || {};
+          function sectorPerfTag(sector) {
+            const p = sectorPerf[sector];
+            if (!p || typeof p.avgPct !== 'number') return '';
+            const up = p.avgPct >= 0;
+            const color = up ? '#16a34a' : '#dc2626';
+            const arrow = up ? '▲' : '▼';
+            return ` <span style="color:${color};font-weight:normal;font-size:12px;">${arrow} ${up ? '+' : ''}${p.avgPct.toFixed(2)}%</span>`;
+          }
+
+          function renderSection(title, items) {
+            if (!items || items.length === 0) return `<h3>${title}</h3><p><em>None right now.</em></p>`;
+            const strengthEmoji = { strong: '🟢', neutral: '⚪', weak: '🔴' };
+            const strengthColors = { strong: '#16a34a', neutral: '#94a3b8', weak: '#dc2626' };
+            const renderRow = function(item) {
+              const entryPart = item.entryDate ? ` &nbsp; since ${item.entryDate} @ $${item.entryPrice}` : '';
+              const strengthPart = item.historicalStrength
+                ? ` &nbsp; <span style="color:${strengthColors[item.historicalStrength.tier]};">${strengthEmoji[item.historicalStrength.tier]} ${item.historicalStrength.avgReturn >= 0 ? '+' : ''}${item.historicalStrength.avgReturn}% historically (n=${item.historicalStrength.n})</span>`
+                : '';
+              return `<li><strong>${item.symbol}</strong> score: ${item.score} @ $${item.lastClose}${entryPart}${strengthPart}</li>`;
+            };
+            const sectorGroups = groupBySector(items); // alphabetical by sector
+            const sections = sectorGroups.map(function(group) {
+              const sorted = group.items.slice().sort((a, b) => b.score - a.score); // highest score first
+              return `<h4 style="margin:10px 0 4px;color:#444;">${group.sector} (${group.items.length})${sectorPerfTag(group.sector)}</h4><ul>${sorted.map(renderRow).join('')}</ul>`;
+            }).join('');
+            return `<h3>${title} (${items.length})</h3>${sections}`;
+          }
+
+          function renderStale(staleItems) {
+            if (!staleItems || staleItems.length === 0) return '';
+            const rows = staleItems.map(function(item) {
+              return `<li><strong>${item.symbol}</strong> &nbsp; last updated ${item.lastKnownDate} @ $${item.lastKnownClose}</li>`;
+            }).join('');
+            return `
+              <div style="border:1px solid #f59e0b;border-radius:4px;margin:8px 0;overflow:hidden;">
+                <div onclick="toggleStalePanel()" style="cursor:pointer;background:#fffbeb;padding:8px 10px;user-select:none;display:flex;align-items:center;gap:6px;">
+                  <span id="stale-caret" style="color:#b45309;font-size:12px;">▸</span>
+                  <strong style="color:#b45309;">⚠️ Stale Data (${staleItems.length})</strong>
+                  <span id="stale-hint" style="color:#92400e;font-size:12px;margin-left:auto;">tap to expand</span>
+                </div>
+                <div id="stale-body" style="display:none;padding:8px 10px;">
+                  <p style="font-size:12px;color:#92400e;margin-top:0;">These symbols failed to fetch fresh data during the last cycle after retries and are showing older prices.</p>
+                  <ul>${rows}</ul>
+                </div>
+              </div>
+            `;
+          }
+
+          function groupBySector(items) {
+            const groups = {};
+            for (const item of items) {
+              const sector = item.sector || 'Unknown';
+              if (!groups[sector]) groups[sector] = [];
+              groups[sector].push(item);
+            }
+            return Object.keys(groups).sort().map(sector => ({ sector, items: groups[sector] }));
+          }
+
+          function renderSellNow(trackedPositions) {
+            const items = trackedPositions || [];
+            const reasonLabels = {
+              profit_target: 'profit target',
+              trailing_stop: 'trailing stop',
+              atr_spike: 'volatility spike',
+              score_reversal: 'score reversed',
+              ma50_breakdown: 'below 50-day avg',
+            };
+            const reasonSeverity = { trailing_stop: 1, ma50_breakdown: 2, score_reversal: 3, atr_spike: 4, profit_target: 5 };
+
+            let toSell = items.filter(item => item.exitStatus && item.exitStatus.closed);
+            if (toSell.length === 0) return `<h3>Sell Triggers</h3><p><em>None right now.</em></p>`;
+
+            toSell.sort((a, b) => (reasonSeverity[a.exitStatus.exitReason] || 3) - (reasonSeverity[b.exitStatus.exitReason] || 3));
+            const totalCount = toSell.length;
+
+            const sectorGroups = groupBySector(toSell);
+            const sections = sectorGroups.map(function(group) {
+              group.items.sort((a, b) => (reasonSeverity[a.exitStatus.exitReason] || 3) - (reasonSeverity[b.exitStatus.exitReason] || 3));
+              const rows = group.items.map(function(item) {
+                const gainPct = ((item.exitStatus.exitPrice - item.entryPrice) / item.entryPrice) * 100;
+                const gainColor = gainPct >= 0 ? '#16a34a' : '#dc2626';
+                const reason = reasonLabels[item.exitStatus.exitReason] || item.exitStatus.exitReason;
+                const strengthEmoji = { strong: '🟢', neutral: '⚪', weak: '🔴' };
+                const strengthColors = { strong: '#16a34a', neutral: '#94a3b8', weak: '#dc2626' };
+                const strengthPart = item.historicalStrength
+                  ? ` &nbsp; <span style="color:${strengthColors[item.historicalStrength.tier]};">${strengthEmoji[item.historicalStrength.tier]}</span>`
+                  : '';
+                return `<li><strong>${item.symbol}</strong> sell @ $${item.exitStatus.exitPrice.toFixed(2)} since ${item.entryDate} @ $${item.entryPrice.toFixed(2)} &nbsp; <span style="color:${gainColor};">${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%</span> &nbsp; (${reason})${strengthPart}</li>`;
+              }).join('');
+              return `<h4 style="margin:10px 0 4px;color:#444;">${group.sector} (${group.items.length})${sectorPerfTag(group.sector)}</h4><ul>${rows}</ul>`;
+            }).join('');
+
+            return `<h3>Sell Triggers (${totalCount})</h3>${sections}`;
+          }
+
+          function renderSellWatch(trackedPositions) {
+            const items = trackedPositions || [];
+            let openItems = items.filter(item => item.exitStatus && !item.exitStatus.closed);
+            if (openItems.length === 0) return `<h3>Sell Watch</h3><p><em>None right now.</em></p>`;
+
+            openItems.sort((a, b) => {
+              const gainA = Math.abs((a.lastClose - a.entryPrice) / a.entryPrice);
+              const gainB = Math.abs((b.lastClose - b.entryPrice) / b.entryPrice);
+              return gainB - gainA;
+            });
+            const totalCount = openItems.length;
+
+            const sectorGroups = groupBySector(openItems);
+            const sections = sectorGroups.map(function(group) {
+              group.items.sort((a, b) => {
+                const gainA = Math.abs((a.lastClose - a.entryPrice) / a.entryPrice);
+                const gainB = Math.abs((b.lastClose - b.entryPrice) / b.entryPrice);
+                return gainB - gainA;
+              });
+              const rows = group.items.map(function(item) {
+                const gainPct = ((item.lastClose - item.entryPrice) / item.entryPrice) * 100;
+                const gainColor = gainPct >= 0 ? '#16a34a' : '#dc2626';
+                const strengthEmoji = { strong: '🟢', neutral: '⚪', weak: '🔴' };
+                const strengthColors = { strong: '#16a34a', neutral: '#94a3b8', weak: '#dc2626' };
+                const strengthPart = item.historicalStrength
+                  ? ` &nbsp; <span style="color:${strengthColors[item.historicalStrength.tier]};">${strengthEmoji[item.historicalStrength.tier]}</span>`
+                  : '';
+                return `<li><strong>${item.symbol}</strong> @ $${item.lastClose} since ${item.entryDate} @ $${item.entryPrice.toFixed(2)} &nbsp; <span style="color:${gainColor};">${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(2)}%</span>${strengthPart}</li>`;
+              }).join('');
+              return `<h4 style="margin:10px 0 4px;color:#444;">${group.sector} (${group.items.length})${sectorPerfTag(group.sector)}</h4><ul>${rows}</ul>`;
+            }).join('');
+
+            return `<h3>Sell Watch (${totalCount})</h3>${sections}`;
+          }
+
+          function renderPersistentPortfolio(pp) {
+            if (!pp) return '';
+            const reasonLabels = {
+              profit_target: 'Profit target', trailing_stop: 'Trailing stop',
+              atr_spike: 'Volatility spike', score_reversal: 'Score reversed', ma50_breakdown: 'Below 50-day avg',
+            };
+            const totalColor = pp.totalReturnPct >= 0 ? '#16a34a' : '#dc2626';
+
+            const renderHoldingRow = function(h) {
+              const color = h.pnlDollar >= 0 ? '#16a34a' : '#dc2626';
+              return `<li><strong>${h.symbol}</strong> &nbsp; entered ${h.entryDate} @ $${h.entryPrice.toFixed(2)} &nbsp; now $${h.currentPrice.toFixed(2)} &nbsp; <span style="color:${color};">${h.pnlPct >= 0 ? '+' : ''}${h.pnlPct.toFixed(2)}% ($${h.pnlDollar >= 0 ? '+' : ''}${h.pnlDollar.toFixed(2)})</span></li>`;
+            };
+            let holdingsHtml;
+            if (!pp.holdings || pp.holdings.length === 0) {
+              holdingsHtml = '<ul><li><em>None right now.</em></li></ul>';
+            } else {
+              const groups = groupBySector(pp.holdings); // alphabetical by sector
+              holdingsHtml = groups.map(function(g) {
+                const sectorValue = g.items.reduce((sum, h) => sum + h.currentValue, 0);
+                const rows = g.items.slice().sort((a, b) => b.pnlPct - a.pnlPct).map(renderHoldingRow).join('');
+                return `<h5 style="margin:8px 0 2px;color:#555;">${g.sector} (${g.items.length}) &nbsp; <span style="font-weight:normal;color:#888;">$${sectorValue.toLocaleString(undefined,{maximumFractionDigits:0})}</span></h5><ul>${rows}</ul>`;
+              }).join('');
+            }
+
+            const recentClosed = pp.closedHistory.slice(-10).reverse();
+            const closedRows = recentClosed.map(function(c) {
+              const color = c.pnlDollar >= 0 ? '#16a34a' : '#dc2626';
+              return `<li><strong>${c.symbol}</strong> &nbsp; ${c.entryDate} @ $${c.entryPrice.toFixed(2)} &rarr; ${c.exitDate} @ $${c.exitPrice.toFixed(2)} &nbsp; <span style="color:${color};">${c.pnlPct >= 0 ? '+' : ''}${c.pnlPct.toFixed(2)}%</span> &nbsp; (${reasonLabels[c.reason] || c.reason})</li>`;
+            }).join('');
+
+            return `
+              <h3>💼 Persistent Paper Portfolio</h3>
+              <p style="font-size:12px;color:#666;">Started with $${pp.startingCash.toLocaleString()}. Evolves day by day: buys $1,000 into new active buy signals when cash is available, sells on real exit triggers, waits for funds when cash runs out. Not real trades.</p>
+              <p style="font-weight:bold;">Total value: <span style="color:${totalColor};">$${pp.totalValue.toLocaleString()} (${pp.totalReturnPct >= 0 ? '+' : ''}${pp.totalReturnPct.toFixed(2)}%)</span> &nbsp; | &nbsp; Cash: $${pp.cash.toLocaleString()} &nbsp; | &nbsp; Holdings: ${pp.holdingsCount} (${pp.holdingsValue.toLocaleString()})</p>
+              <h4 style="margin:10px 0 4px;">Current Holdings (${pp.holdings.length})</h4>
+              ${holdingsHtml}
+              <h4 style="margin:10px 0 4px;">Recent Closed Trades (last ${recentClosed.length} of ${pp.closedHistory.length} total)</h4>
+              <ul>${closedRows || '<li><em>None yet.</em></li>'}</ul>
+            `;
+          }
+
+          function renderPaperTrading(longItems) {
+            if (!longItems || longItems.length === 0) return '';
+            const POSITION_SIZE = 1000; // hypothetical $ per position, matches original backtest convention
+
+            const reasonLabels = {
+              profit_target: 'Profit target hit',
+              trailing_stop: 'Trailing stop hit',
+              atr_spike: 'Volatility spike exit',
+              score_reversal: 'Score reversed',
+              ma50_breakdown: 'Broke below 50-day average',
+            };
+
+            let totalInvested = 0, totalCurrentValue = 0, openCount = 0, closedCount = 0;
+            const rows = longItems.map(function(item) {
+              if (!item.entryPrice) return '';
+              const shares = POSITION_SIZE / item.entryPrice;
+              const pt = item.exitStatus || { closed: false };
+              const exitPrice = pt.closed ? pt.exitPrice : item.lastClose;
+              const currentValue = shares * exitPrice;
+              const pnlDollar = currentValue - POSITION_SIZE;
+              const pnlPct = (pnlDollar / POSITION_SIZE) * 100;
+              totalInvested += POSITION_SIZE;
+              totalCurrentValue += currentValue;
+              const color = pnlDollar >= 0 ? '#16a34a' : '#dc2626';
+              const statusPart = pt.closed
+                ? ` &nbsp; <span style="color:#666;">[CLOSED ${pt.exitDate} — ${reasonLabels[pt.exitReason] || pt.exitReason}]</span>`
+                : ` &nbsp; <span style="color:#2563eb;">[OPEN]</span>`;
+              if (pt.closed) closedCount++; else openCount++;
+              return `<li><strong>${item.symbol}</strong> &nbsp; entered ${item.entryDate} @ $${item.entryPrice.toFixed(2)} &nbsp; exit $${exitPrice.toFixed(2)} &nbsp; <span style="color:${color};">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% ($${pnlDollar >= 0 ? '+' : ''}${pnlDollar.toFixed(2)})</span>${statusPart}</li>`;
+            }).join('');
+
+            const totalPnl = totalCurrentValue - totalInvested;
+            const totalPnlPct = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
+            const totalColor = totalPnl >= 0 ? '#16a34a' : '#dc2626';
+
+            return `
+              <h3>📊 Paper Trading — Buy Positions</h3>
+              <p style="font-size:12px;color:#666;">Hypothetical $${POSITION_SIZE} per position, sized at each signal's actual entry price. Applies the 5 documented exit rules (profit target, trailing stop, ATR spike, score reversal, MA50 breakdown) — closed positions use the real simulated exit price, not today's price. Not real trades.</p>
+              <p style="font-weight:bold;">Portfolio total (${openCount} open, ${closedCount} closed): <span style="color:${totalColor};">${totalPnlPct >= 0 ? '+' : ''}${totalPnlPct.toFixed(2)}% ($${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)} on $${totalInvested.toFixed(0)} invested)</span></p>
+              <ul>${rows}</ul>
+            `;
+          }
+
+          // Takes the full HTML a section renderer returns (which starts with
+          // an <h3>Title (N)</h3> header) and repackages it as a collapsible
+          // panel. Falls back to the raw HTML if the header can't be parsed.
+          function wrapCollapsible(id, html, accent) {
+            const m = html.match(/^\s*<h3[^>]*>([\s\S]*?)<\/h3>([\s\S]*)$/);
+            if (!m) return html;
+            const headerText = m[1].replace(/&nbsp;/g, ' ').trim(); // e.g. "Sell Triggers (12)"
+            const body = m[2];
+            const cm = headerText.match(/^(.*?)\s*\(([^)]*)\)\s*$/);
+            const title = cm ? cm[1] : headerText;
+            const count = cm ? cm[2] : '';
+            return collapsibleSection(id, title, count, body, accent);
+          }
+
+          setStatus(`
+            <div>
+              <p><small>Report as of ${report.asOfDate}</small></p>
+              ${wrapCollapsible('active-buys', renderSection('Active Buy Signals', report.long), '#166534')}
+              ${wrapCollapsible('sell-triggers', renderSellNow(report.trackedPositions), '#b91c1c')}
+              <hr style="margin:20px 0;border:none;border-top:1px solid #ddd;">
+              ${wrapCollapsible('buy-watch', renderSection('Buy Watch List', report.longWatch), '#166534')}
+              ${wrapCollapsible('sell-watch', renderSellWatch(report.trackedPositions), '#b91c1c')}
+              <hr style="margin:20px 0;border:none;border-top:1px solid #ddd;">
+              ${renderStale(report.stale)}
+              <div id="unknown-sectors-panel">${renderUnknownPanel(report)}</div>
+              ${renderPaperTrading(report.long)}
+              ${renderPersistentPortfolio(report.paperPortfolio)}
+            </div>
+          `);
+          return report;
+        }).catch(function(err) {
+          setStatus(`<p style="color:red;">Failed to load report: ${err.message || String(err)}</p>`);
+        });
+      }
+
+      window.addEventListener('load', function() {
+        loadSavedOverrides().then(renderReport);
+      });
+    </script>
+  </body>
+</html>
