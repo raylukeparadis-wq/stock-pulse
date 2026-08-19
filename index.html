@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Stock Pulse</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+    <div id="stock-pulse-report">Loading report...</div>
+    <script>
+      const WORKER_BASE = 'https://stock-pulse-worker.raylukeparadis.workers.dev';
+      const STANDARD_SECTORS = [
+        'Communication Services', 'Consumer Discretionary', 'Consumer Staples',
+        'Energy', 'Financials', 'Health Care', 'Industrials',
+        'Information Technology', 'Materials', 'Real Estate', 'Utilities',
+      ];
+      let sessionToken = null;              // in-memory only
+      const pendingSectors = {};            // symbol -> chosen sector this session
+      let savedOverrides = {};              // symbol -> sector, pulled from backend KV (survives reloads)
+      async function loadSavedOverrides() {
+        try {
+          const res = await fetch(`${WORKER_BASE}/config/sector-overrides`);
+          if (!res.ok) return;
+          const data = await res.json();
+          savedOverrides = (data && data.overrides) ? data.overrides : {};
+        } catch (e) { /* leave savedOverrides as-is on failure */ }
+      }
+      function setStatus(msg) {
+        const el = document.getElementById('stock-pulse-report');
+        if (el) el.innerHTML = msg;
+      }
+      async function loadReport() {
+        const resp = await fetch(`${WORKER_BASE}/report/latest`);
+        return resp.json();
+      }
+      function collectUnknownSymbols(report) {
+        const seen = new Set();
+        const unknowns = [];
+        const consider = (item) => {
+          if (!item || !item.symbol) return;
+          const sector = item.sector || 'Unknown';
+          if (sector !== 'Unknown') return;
+          if (seen.has(item.symbol)) return;
+          seen.add(item.symbol);
+          unknowns.push(item.symbol);
+        };
+        (report.long || []).forEach(consider);
+        (report.longWatch || []).forEach(consider);
+        (report.trackedPositions || []).forEach(consider);
+        if (report.paperPortfolio && report.paperPortfolio.holdings) {
+          report.paperPortfolio.holdings.forEach(consider);
+        }
+        unknowns.sort();
+        return unknowns;
+      }
+      function renderUnknownPanel(report) {
+        const unknowns = collectUnknownSymbols(report);
+        if (unknowns.length === 0) return '';
+        const options = ['<option value="">— pick sector —</option>']
+          .concat(STANDARD_SECTORS.map(s => `<option value="${s}">${s}</option>`))
+          .concat(['<option value="__remove__">Remove override</option>'])
+          .join('');
+        const assignedSector = (sym) => pendingSectors[sym] || savedOverrides[sym] || null;
+        const unhandled = unknowns.filter(sym => !assignedSector(sym));
+        const assigned = unknowns.filter(sym => assignedSector(sym));
+        const unhandledRows = unhandled.map(function(sym) {
+          return `<li data-sym="${sym}" style="background:#fef3c7;border-left:3px solid #f59e0b;padding:6px 8px;margin:4px 0;list-style:none;border-radius:3px;">
+            <strong>${sym}</strong> &nbsp;
+            <select onchange="assignSector('${sym}', this.value)" style="padding:3px;">${options}</select>
+          </li>`;
+        }).join('');
+        const assignedRows = assigned.map(function(sym) {
+          const sector = assignedSector(sym);
+          return `<li data-sym="${sym}" style="background:#dbeafe;border-left:3px solid #3b82f6;padding:6px 8px;margin:4px 0;list-style:none;border-radius:3px;">
+            <strong>${sym}</strong> <span style="color:#1d4ed8;font-size:12px;"> &nbsp; ✓ set to <strong>${sector}</strong> — applies next cycle</span>
+          </li>`;
+        }).join('');
+        const unhandledBlock = unhandled.length
+          ? `<ul style="padding-left:0;">${unhandledRows}</ul>`
+          : `<p style="font-size:12px;color:#166534;">All current unknowns have been assigned — waiting on the next refresh cycle.</p>`;
+        const assignedBlock = assigned.length
+          ? `<h4 style="margin:10px 0 4px;color:#1d4ed8;">Assigned, pending next cycle (${assigned.length})</h4><ul style="padding-left:0;">${assignedRows}</ul>`
+          : '';
+        return `
+          <div style="border:1px solid #f59e0b;border-radius:4px;margin:8px 0;overflow:hidden;">
+            <div onclick="toggleUnknownPanel()" style="cursor:pointer;background:#fffbeb;padding:8px 10px;user-select:none;display:flex;align-items:center;gap:6px;">
+              <span id="unknown-caret" style="color:#b45309;font-size:12px;">▸</span>
+              <strong style="color:#b45309;">🏷️ Unknown Sectors (${unknowns.length})</strong>
+              <span id="unknown-hint" style="color:#92400e;font-size:12px;margin-left:auto;">tap to expand</span>
+            </div>
+            <div id="unknown-body" style="display:none;padding:8px 10px;">
+              <p style="font-size:12px;color:#92400e;margin-top:0;">Symbols with no sector mapping. Amber = pick a sector to assign one (you'll be asked for your admin token once per session). Blue = already assigned and waiting for the next refresh cycle to take effect.</p>
+              ${unhandledBlock}
+              ${assignedBlock}
+            </div>
+          </div>
+        `;
+      }
+      function togglePanel(id) {
+        const body = document.getElementById(id + '-body');
+        const caret = document.getElementById(id + '-caret');
+        const hint = document.getElementById(id + '-hint');
+        if (!body) return;
+        const open = body.style.display !== 'none';
+        body.style.display = open ? 'none' : 'block';
+        if (caret) caret.textContent = open ? '▸' : '▾';
+        if (hint) hint.textContent = open ? 'tap to expand' : 'tap to collapse';
+      }
+      function collapsibleSection(id, titleHtml, count, bodyHtml, accent) {
+        const color = accent || '#334155';
+        const countPart = (count === '' || count === null || count === undefined) ? '' : ` (${count})`;
+        return `
+          <div style="border:1px solid #cbd5e1;border-radius:4px;margin:8px 0;overflow:hidden;">
+            <div onclick="togglePanel('${id}')" style="cursor:pointer;background:#f8fafc;padding:8px 10px;user-select:none;display:flex;align-items:center;gap:6px;">
+              <span id="${id}-caret" style="color:${color};font-size:12px;">▸</span>
+              <strong style="color:${color};">${titleHtml}${countPart}</strong>
+              <span id="${id}-hint" style="color:#64748b;font-size:12px;margin-left:auto;">tap to expand</span>
+            </div>
+            <div id="${id}-body" style="display:none;padding:8px 10px;">${bodyHtml}</div>
+          </div>
+        `;
+      }
+      function toggleUnknownPanel() { togglePanel('unknown'); }
+      function toggleStalePanel() { togglePanel('stale'); }
+      async function assignSector(symbol, value) {
+        if (!value) return; // blank re-selection, ignore
+        if (!sessionToken) {
+          sessionToken = window.prompt('Admin token (held only until you close this page):');
+          if (!sessionToken) return; // cancelled
+        }
+        const isRemove = value === '__remove__';
+        const body = {};
+        body[symbol] = isRemove ? null : value;
+        try {
+          const res = await fetch(`${WORKER_BASE}/config/sector-overrides`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Seed-Token': sessionToken },
+            body: JSON.stringify(body),
+          });
+          if (res.status === 401) {
+            sessionToken = null; // wrong token -- clear so we re-prompt next time
+            alert('Unauthorized — token cleared. Try again.');
+            return;
+          }
+          if (!res.ok) {
+            alert(`Save failed (${res.status}).`);
+            return;
+          }
+          if (isRemove) {
+            delete pendingSectors[symbol];
+            delete savedOverrides[symbol];
+          } else {
+            pendingSectors[symbol] = value;
+            savedOverrides[symbol] = value;
+          }
+          refreshUnknownPanel();
+        } catch (e) {
+          alert('Save error: ' + (e.message || String(e)));
+        }
+      }
+      let lastReport = null;
+      function refreshUnknownPanel() {
+        const container = document.getElementById('unknown-sectors-panel');
+        if (!container || !lastReport) return;
+        const prevBody = document.getElementById('unknown-body');
+        const wasOpen = prevBody && prevBody.style.display !== 'none';
+        container.innerHTML = renderUnknownPanel(lastReport);
+        if (wasOpen) {
+          const body = document.getElementById('unknown-body');
+          const caret = document.getElementById('unknown-caret');
+          if (body) body.style.display = 'block';
+          if (caret) caret.textContent = '▾';
+          const hint = document.getElementById('unknown-hint');
+          if (hint) hint.textContent = 'tap to collapse';
+        }
+      }
+      function renderReport() {
+        return loadReport().then(function(report) {
+          if (report.error) {
+            setStatus('<p>No report available yet. Check back after the next scheduled refresh.</p>');
+            return report;
+          }
+          lastReport = report;
+          const sectorPerf = report.sectorPerformance || {};
+          function sectorPerfTag(sector) {
+            const p = sectorPerf[sector];
+            if (!p || typeof p.avgPct !== 'number') return '';
+            const up = p.avgPct >= 0;
+            const color = up ? '#16a34a' : '#dc2626';
+            const arrow = up ? '▲' : '▼';
+            return ` <span style="color:${color};font-weight:normal;font-size:12px;">${arrow} ${up ? '+' : ''}${p.avgPct.toFixed(2)}%</span>`;
+          }
+          function renderSection(title, items) {
+            if (!items || items.length === 0) return `<h3>${title}</h3><p><em>None right now.</em></p>`;
+            const strengthEmoji = { strong: '🟢', neutral: '⚪', weak: '🔴' };
+            const strengthColors = { strong: '#16a34a', neutral: '#94a3b8', weak: '#dc2626' };
+            const renderRow = function(item) {
+              const entryPart = item.entryDate ? ` &nbsp; since ${item.entryDate} @ $${item.entryPrice}` : '';
+              const strengthPart = item.historicalStrength
+                ? ` &nbsp; <span style="color:${strengthColors[item.historicalStrength.tier]};">${strengthEmoji[item.historicalStrength.tier]} ${item.historicalStrength.avgReturn >= 0 ? '+' : ''}${item.historicalStrength.avgReturn}% historically (n=${item.historicalStrength.n})</span>`
+                : '';
+              const reasonPart = item.watchReason
+                ? ` &nbsp; <span style="color:${item.nearMiss ? (item.nearMissTier === 'guard' ? '#ea580c' : '#a16207') : '#0369a1'};font-size:12px;${item.nearMissTier === 'guard' ? 'font-weight:600;' : ''}">[${item.watchReason}]</span>`
+                : '';
+              return `<li><strong>${item.symbol}</strong> score: ${item.score} @ $${item.lastClose}${entryPart}${reasonPart}${strengthPart}</li>`;
+            };
+            // rank: persistence-watch (needs day 2) first, then guard-blocked near-misses
+            // (strong signal, one guard away), then score-short near-misses. Within a
+            // tier, higher score first.
+            const rank = function(it) {
+              if (!it.nearMiss) return 0;               // classic "needs day 2"
+              return it.nearMissTier === 'guard' ? 1 : 2;
+            };
+            const sectorGroups = groupBySector(items); // alphabetical by sector
+            const sections = sectorGroups.map(function(group) {
+              const sorted = group.items.slice().sort((a, b) => rank(a) - rank(b) || b.score - a.score);
+              return `<h4 style="margin:10px 0 4px;color:#444;">${group.sector} (${group.items.length})${sectorPerfTag(group.sector)}</h4><ul>${sorted.map(renderRow).join('')}</ul>`;
+            }).join('');
+            return `<h3>${title} (${items.length})</h3>${sections}`;
+          }
+          function renderStale(staleItems) {
+            if (!staleItems || staleItems.length === 0) return '';
+            const rows = staleItems.map(function(item) {
+              return `<li><strong>${item.symbol}</strong> &nbsp; last updated ${item.lastKnownDate} @ $${item.lastKnownClose}</li>`;
+            }).join('');
+            return `
+              <div style="border:1px solid #f59e0b;border-radius:4px;margin:8px 0;overflow:hidden;">
+                <div onclick="toggleStalePanel()" style="cursor:pointer;background:#fffbeb;padding:8px 10px;user-select:none;display:flex;align-items:center;gap:6px;">
+                  <span id="stale-caret" style="color:#b45309;font-size:12px;">▸</span>
+                  <strong style="color:#b45309;">⚠️ Stale Data (${staleItems.length})</strong>
+                  <span id="stale-hint" style="color:#92400e;font-size:12px;margin-left:auto;">tap to expand</span>
+                </div>
+                <div id="stale-body" style="display:none;padding:8px 10px;">
+                  <p style="font-size:12px;color:#92400e;margin-top:0;">These symbols failed to fetch fresh data during the last cycle after retries and are showing older prices.</p>
+                  <ul>${rows}</ul>
+                </div>
+              </div>
+            `;
+          }
+          function groupBySector(items) {
+            const groups = {};
+            for (const item of items) {
+              const sector = item.sector || 'Unknown';
+              if (!groups[sector]) groups[sector] = [];
+              groups[sector].push(item);
+            }
+            return Object.keys(groups).sort().map(sector => ({ sector, items: groups[sector] }));
+          }
+          function renderSellNow(pp) {
+            const holdings = (pp && pp.holdings) || [];
+            const toSell = holdings.filter(h => h.atDrawdownExit);
+            if (toSell.length === 0) return `<h3>Sell Triggers</h3><p><em>None right now.</em></p>`;
+            toSell.sort((a, b) => b.drawdownPct - a.drawdownPct);
+            const sectorGroups = groupBySector(toSell);
+            const sections = sectorGroups.map(function(group) {
+              group.items.sort((a, b) => b.drawdownPct - a.drawdownPct);
+              const rows = group.items.map(function(h) {
+                const marker = h.pyramidRounds > 0 ? ` <span style="color:#b45309;">${'▲'.repeat(h.pyramidRounds)}</span>` : '';
+                return `<li><strong>${h.symbol}</strong>${marker} @ $${h.currentPrice.toFixed(2)} &nbsp; peak $${h.peakPrice.toFixed(2)} &nbsp; <span style="color:#dc2626;">−${h.drawdownPct.toFixed(1)}% from peak</span> &nbsp; (25% drawdown exit)</li>`;
+              }).join('');
+              return `<h4 style="margin:10px 0 4px;color:#444;">${group.sector} (${group.items.length})${sectorPerfTag(group.sector)}</h4><ul>${rows}</ul>`;
+            }).join('');
+            return `<h3>Sell Triggers (${toSell.length})</h3>${sections}`;
+          }
+          function renderSellWatch(pp) {
+            const holdings = (pp && pp.holdings) || [];
+            const watch = holdings.filter(h => h.nearDrawdown);
+            if (watch.length === 0) return `<h3>Sell Watch</h3><p><em>None right now.</em></p>`;
+            watch.sort((a, b) => b.drawdownPct - a.drawdownPct);
+            const sectorGroups = groupBySector(watch);
+            const sections = sectorGroups.map(function(group) {
+              group.items.sort((a, b) => b.drawdownPct - a.drawdownPct);
+              const rows = group.items.map(function(h) {
+                const marker = h.pyramidRounds > 0 ? ` <span style="color:#b45309;">${'▲'.repeat(h.pyramidRounds)}</span>` : '';
+                return `<li><strong>${h.symbol}</strong>${marker} @ $${h.currentPrice.toFixed(2)} &nbsp; peak $${h.peakPrice.toFixed(2)} &nbsp; <span style="color:#d97706;">−${h.drawdownPct.toFixed(1)}% from peak</span> &nbsp; (exits at −25%)</li>`;
+              }).join('');
+              return `<h4 style="margin:10px 0 4px;color:#444;">${group.sector} (${group.items.length})${sectorPerfTag(group.sector)}</h4><ul>${rows}</ul>`;
+            }).join('');
+            return `<h3>Sell Watch (${watch.length})</h3>${sections}`;
+          }
+          function renderHarvestDue(pp) {
+            const holdings = (pp && pp.holdings) || [];
+            const due = holdings.filter(h => h.harvestDue);
+            if (due.length === 0) return `<h3>💰 Harvest Due</h3><p><em>None right now.</em></p>`;
+            due.sort((a, b) => b.pnlPct - a.pnlPct);
+            const sectorGroups = groupBySector(due);
+            const sections = sectorGroups.map(function(group) {
+              const rows = group.items.map(function(h) {
+                const marker = h.pyramidRounds > 0 ? ` <span style="color:#b45309;">${'▲'.repeat(h.pyramidRounds)}</span>` : '';
+                return `<li><strong>${h.symbol}</strong>${marker} @ $${h.currentPrice.toFixed(2)} &nbsp; <span style="color:#16a34a;">+25% climb — profit trim due</span></li>`;
+              }).join('');
+              return `<h4 style="margin:10px 0 4px;color:#444;">${group.sector} (${group.items.length})${sectorPerfTag(group.sector)}</h4><ul>${rows}</ul>`;
+            }).join('');
+            return `<h3>💰 Harvest Due (${due.length})</h3>${sections}`;
+          }
+          function renderPersistentPortfolio(pp) {
+            if (!pp) return '';
+            const reasonLabels = {
+              profit_target: 'Profit target', trailing_stop: 'Trailing stop',
+              atr_spike: 'Volatility spike', score_reversal: 'Score reversed', ma50_breakdown: 'Below 50-day avg',
+            };
+            const totalColor = pp.totalReturnPct >= 0 ? '#16a34a' : '#dc2626';
+            const renderHoldingRow = function(h) {
+              const color = h.pnlDollar >= 0 ? '#16a34a' : '#dc2626';
+              const rounds = h.pyramidRounds || 0;
+              const marker = rounds > 0 ? ` <span style="color:#b45309;" title="${rounds} pyramid round${rounds>1?'s':''} (${h.trancheCount} tranches, $${(h.invested||0).toLocaleString()} invested)">${'▲'.repeat(rounds)}</span>` : '';
+              const harvestPart = (h.harvested && h.harvested > 0) ? ` &nbsp; <span style="color:#0369a1;font-size:12px;">banked $${h.harvested.toFixed(2)}</span>` : '';
+              const investedPart = (h.trancheCount && h.trancheCount > 1) ? ` &nbsp; <span style="color:#666;font-size:12px;">($${(h.invested||0).toLocaleString()} in)</span>` : '';
+              return `<li><strong>${h.symbol}</strong>${marker} &nbsp; entered ${h.entryDate} @ $${h.entryPrice.toFixed(2)} &nbsp; now $${h.currentPrice.toFixed(2)}${investedPart}${harvestPart} &nbsp; <span style="color:${color};">${h.pnlPct >= 0 ? '+' : ''}${h.pnlPct.toFixed(2)}% ($${h.pnlDollar >= 0 ? '+' : ''}${h.pnlDollar.toFixed(2)})</span></li>`;
+            };
+            let holdingsHtml;
+            if (!pp.holdings || pp.holdings.length === 0) {
+              holdingsHtml = '<ul><li><em>None right now.</em></li></ul>';
+            } else {
+              const groups = groupBySector(pp.holdings); // alphabetical by sector
+              holdingsHtml = groups.map(function(g) {
+                const sectorValue = g.items.reduce((sum, h) => sum + h.currentValue, 0);
+                const sectorCost = g.items.length * 1000; // $1000 invested per position
+                const sectorColor = sectorValue > sectorCost ? '#16a34a' : (sectorValue < sectorCost ? '#dc2626' : '#2563eb');
+                const rows = g.items.slice().sort((a, b) => b.pnlPct - a.pnlPct).map(renderHoldingRow).join('');
+                return `<h5 style="margin:8px 0 2px;color:#555;">${g.sector} (${g.items.length}) &nbsp; <span style="font-weight:normal;color:${sectorColor};">$${sectorValue.toLocaleString(undefined,{maximumFractionDigits:0})}</span></h5><ul>${rows}</ul>`;
+              }).join('');
+            }
+            const recentClosed = pp.closedHistory.slice(-10).reverse();
+            const closedRows = recentClosed.map(function(c) {
+              const color = c.pnlDollar >= 0 ? '#16a34a' : '#dc2626';
+              const sectorPart = c.sector ? ` &nbsp; <em style="color:#666;">(${c.sector})</em>` : '';
+              const rounds = (c.tranches && c.tranches > 1) ? c.tranches - 1 : 0;
+              const marker = rounds > 0 ? ` <span style="color:#b45309;">${'▲'.repeat(rounds)}</span>` : '';
+              const harvestPart = (c.harvested && c.harvested > 0) ? ` &nbsp; <span style="color:#0369a1;font-size:12px;">banked $${c.harvested.toFixed(2)}</span>` : '';
+              const reasonLbl = reasonLabels[c.reason] || (c.reason === 'drawdown_25pct' ? '25% drawdown' : c.reason);
+              return `<li><strong>${c.symbol}</strong>${marker}${sectorPart} &nbsp; ${c.entryDate} @ $${c.entryPrice.toFixed(2)} &rarr; ${c.exitDate} @ $${c.exitPrice.toFixed(2)}${harvestPart} &nbsp; <span style="color:${color};">${c.pnlPct >= 0 ? '+' : ''}${c.pnlPct.toFixed(2)}%</span> &nbsp; (${reasonLbl})</li>`;
+            }).join('');
+            return `
+              <h3>💼 Persistent Paper Portfolio</h3>
+              <p style="font-size:12px;color:#666;">Started with $${pp.startingCash.toLocaleString()}. Buys $1,000 into new active buy signals. Harvests profit each +25% climb (trims back to $1,000, banks the gain). Pyramids +$1,000 (▲ per round) when a paid-out position re-triggers a buy signal and cash is available. Exits fully only on a 25% drop from the position's peak price. Not real trades.</p>
+              <p style="font-weight:bold;">Total value: <span style="color:${totalColor};">$${pp.totalValue.toLocaleString()} (${pp.totalReturnPct >= 0 ? '+' : ''}${pp.totalReturnPct.toFixed(2)}%)</span> &nbsp; | &nbsp; Cash: $${pp.cash.toLocaleString()} &nbsp; | &nbsp; Holdings: ${pp.holdingsCount} (${pp.holdingsValue.toLocaleString()})</p>
+              <h4 style="margin:10px 0 4px;">Current Holdings (${pp.holdings.length})</h4>
+              ${holdingsHtml}
+              <h4 style="margin:10px 0 4px;">Recent Closed Trades (last ${recentClosed.length} of ${pp.closedHistory.length} total)</h4>
+              <ul>${closedRows || '<li><em>None yet.</em></li>'}</ul>
+            `;
+          }
+          function wrapCollapsible(id, html, accent) {
+            const m = html.match(/^\s*<h3[^>]*>([\s\S]*?)<\/h3>([\s\S]*)$/);
+            if (!m) return html;
+            const headerText = m[1].replace(/&nbsp;/g, ' ').trim(); // e.g. "Sell Triggers (12)"
+            const body = m[2];
+            const cm = headerText.match(/^(.*?)\s*\(([^)]*)\)\s*$/);
+            const title = cm ? cm[1] : headerText;
+            const count = cm ? cm[2] : '';
+            return collapsibleSection(id, title, count, body, accent);
+          }
+          setStatus(`
+            <div>
+              <p><small>Report as of ${report.asOfDate}</small></p>
+              ${wrapCollapsible('active-buys', renderSection('Active Buy Signals', report.long), '#166534')}
+              ${wrapCollapsible('sell-triggers', renderSellNow(report.paperPortfolio), '#b91c1c')}
+              ${wrapCollapsible('harvest-due', renderHarvestDue(report.paperPortfolio), '#166534')}
+              <hr style="margin:20px 0;border:none;border-top:1px solid #ddd;">
+              ${wrapCollapsible('buy-watch', renderSection('Buy Watch List', report.longWatch), '#166534')}
+              ${wrapCollapsible('sell-watch', renderSellWatch(report.paperPortfolio), '#b91c1c')}
+              <hr style="margin:20px 0;border:none;border-top:1px solid #ddd;">
+              ${renderStale(report.stale)}
+              <div id="unknown-sectors-panel">${renderUnknownPanel(report)}</div>
+              ${renderPersistentPortfolio(report.paperPortfolio)}
+            </div>
+          `);
+          return report;
+        }).catch(function(err) {
+          setStatus(`<p style="color:red;">Failed to load report: ${err.message || String(err)}</p>`);
+        });
+      }
+      window.addEventListener('load', function() {
+        loadSavedOverrides().then(renderReport);
+      });
+    </script>
+  </body>
+</html>
